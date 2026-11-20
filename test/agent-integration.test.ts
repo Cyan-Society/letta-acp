@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentContext, McpServer } from "@agentclientprotocol/sdk";
 import type { LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
 import { LettaAcpAgent, toSdkMcpServers } from "../src/agent.js";
 import { SessionRegistry } from "../src/session-registry.js";
+import type { LettaAcpConfig } from "../src/config.js";
 
 interface RuntimeScope {
   agent_id: string;
@@ -21,6 +22,15 @@ interface ServerSocket {
 }
 
 class FakeAppServer {
+  readonly runtimeStarts: WireMessage[] = [];
+  readonly historyRequests: WireMessage[] = [];
+  readonly inputs: WireMessage[] = [];
+  readonly executeCommands: WireMessage[] = [];
+  failDefault = false;
+  failDefaultHistory = false;
+  failCatalog = false;
+  failHistoryAfterBootstrap = false;
+  unexpectedDefaultConversation: string | undefined;
   readonly runtimeStartRequestIds: string[] = [];
   readonly createdAgentBodies: WireMessage[] = [];
   readonly createdAgentPinGlobals: unknown[] = [];
@@ -150,7 +160,16 @@ class FakeAppServer {
     switch (message.type) {
       case "runtime_start": {
         const requestId = requiredString(message.request_id, "runtime_start.request_id");
-        const conversationId = `conv-test-${++this.nextConversation}`;
+        this.runtimeStarts.push(message);
+        if (this.failDefault && message.conversation_id === "default") {
+          socket.push({ type: "runtime_start_response", request_id: requestId, success: false, error: "default unavailable" });
+          return;
+        }
+        const conversationId = message.conversation_id === "default"
+          ? this.unexpectedDefaultConversation ?? "default"
+          : typeof message.conversation_id === "string"
+            ? message.conversation_id
+            : `conv-test-${++this.nextConversation}`;
         const createAgent = message.create_agent as
           | { body?: WireMessage; pin_global?: boolean }
           | undefined;
@@ -220,7 +239,14 @@ class FakeAppServer {
         });
         return;
       }
-      case "conversation_messages_list":
+      case "conversation_messages_list": {
+        this.historyRequests.push(message);
+        const isDefault = message.conversation_id === "default";
+        const query = message.query as WireMessage;
+        if (isDefault && (query.agent_id !== "agent-test" || this.failDefaultHistory || (this.failHistoryAfterBootstrap && this.historyRequests.length > 1))) {
+          socket.push({ type: "conversation_messages_list_response", request_id: message.request_id, success: false, error: "default history unavailable" });
+          return;
+        }
         socket.push({
           type: "conversation_messages_list_response",
           request_id: requiredString(
@@ -228,11 +254,16 @@ class FakeAppServer {
             "conversation_messages_list.request_id",
           ),
           success: true,
-          messages: [],
+          messages: isDefault ? [{ id: "message-default", message_type: "user_message", content: "ORIGINAL_DEFAULT_HISTORY" }] : [],
           has_more: false,
         });
         return;
+      }
       case "list_models":
+        if (this.failCatalog) {
+          socket.push({ type: "list_models_response", request_id: message.request_id, success: false, error: "catalog unavailable" });
+          return;
+        }
         socket.push({
           type: "list_models_response",
           request_id: requiredString(message.request_id, "list_models.request_id"),
@@ -284,6 +315,7 @@ class FakeAppServer {
         this.handleInput(socket, message);
         return;
       case "execute_command":
+        this.executeCommands.push(message);
         this.handleCommand(socket, message);
         return;
       case "abort_message":
@@ -313,6 +345,7 @@ class FakeAppServer {
   }
 
   private handleInput(socket: ServerSocket, message: WireMessage): void {
+    this.inputs.push(message);
     const runtime = message.runtime as RuntimeScope;
     const payload = message.payload as Record<string, unknown>;
     this.activeControlSocket = socket;
@@ -629,14 +662,7 @@ function requiredString(value: unknown, label: string): string {
 
 function createAgent(
   server: FakeAppServer,
-  overrides: {
-    agentId?: string;
-    model?: string;
-    sessionRegistryDir?: string | null;
-    sessionRegistryScope?: string;
-    outOfTurnPermissionTimeoutMs?: number;
-    prematureResultGraceMs?: number;
-  } = {},
+  overrides: Partial<LettaAcpConfig> = {},
 ): LettaAcpAgent {
   return new LettaAcpAgent({
     clientOptions: {
@@ -659,6 +685,7 @@ function createContext(
     answerPermissions?: boolean;
     permissionDelayMs?: number;
     permissionOptionId?: "allow_once" | "allow_always" | "reject_once";
+    failHistoryReplay?: boolean;
   } = {},
 ) {
   const answerPermissions = options.answerPermissions ?? true;
@@ -669,6 +696,9 @@ function createContext(
   const permissionSignals: Array<AbortSignal | undefined> = [];
   const context = {
     notify: async (_method: unknown, params: { update: WireMessage }) => {
+      if (options.failHistoryReplay && params.update.sessionUpdate === "user_message_chunk") {
+        throw new Error("client replay disconnected");
+      }
       updates.push(params.update);
     },
     request: async (
@@ -700,6 +730,214 @@ async function openSession(
 }
 
 describe("Agent SDK app-server integration", () => {
+  test("fresh processes and default reload resume the agent-scoped default and replay history", async () => {
+    const server = new FakeAppServer();
+    for (const reload of [false, false, true]) {
+      const agent = createAgent(server, { useDefaultConversation: true, serverModel: true });
+      const { context, updates } = createContext();
+      try {
+        if (reload) {
+          await agent.loadSession({ sessionId: "default", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+          expect(updates).toContainEqual({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "ORIGINAL_DEFAULT_HISTORY" } });
+        } else {
+          expect((await openSession(agent, context)).sessionId).toBe("default");
+        }
+        expect((await agent.listSessions({ cwd: "/tmp/letta-acp-test" })).sessions).toEqual([
+          { sessionId: "default", cwd: "/tmp/letta-acp-test", title: "Default Letta conversation" },
+        ]);
+      } finally { agent.shutdown(); }
+    }
+    expect(server.runtimeStarts).toHaveLength(3);
+    for (const start of server.runtimeStarts) {
+      expect(start).toMatchObject({ agent_id: "agent-test", conversation_id: "default" });
+      expect(start.create_conversation).toBeUndefined();
+      expect(start.create_agent).toBeUndefined();
+    }
+    expect(server.historyRequests.length).toBeGreaterThanOrEqual(4);
+    for (const read of server.historyRequests) {
+      expect(read).toMatchObject({ conversation_id: "default", query: { agent_id: "agent-test" } });
+    }
+    expect(server.inputs).toEqual([]);
+    expect(server.updatedModelPayloads).toEqual([]);
+  });
+
+  test("missing defaults, history failures, and unexpected routing close without creating a replacement", async () => {
+    for (const failure of ["resume", "history", "identity"] as const) {
+      const server = new FakeAppServer();
+      server.failDefault = failure === "resume";
+      server.failDefaultHistory = failure === "history";
+      server.unexpectedDefaultConversation = failure === "identity" ? "conv-unexpected" : undefined;
+      const agent = createAgent(server, { useDefaultConversation: true });
+      const { context } = createContext();
+      try {
+        await expect(openSession(agent, context)).rejects.toThrow(/default/i);
+        expect(server.runtimeStarts).toHaveLength(1);
+        expect(server.runtimeStarts[0]?.create_conversation).toBeUndefined();
+        expect(server.createdAgentBodies).toEqual([]);
+        expect(server.closedSockets).toBeGreaterThan(0);
+      } finally { agent.shutdown(); }
+    }
+  });
+
+  test("default routing leaves explicitly selected historical threads resumable", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { useDefaultConversation: true, serverModel: true });
+    const { context } = createContext();
+    try {
+      await agent.loadSession({ sessionId: "local-conv-previous", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+      expect(server.runtimeStarts[0]).toMatchObject({ conversation_id: "local-conv-previous" });
+      expect(server.historyRequests.at(-1)?.conversation_id).toBe("local-conv-previous");
+    } finally { agent.shutdown(); }
+  });
+
+  test("a failed history replay releases the opened default session", async () => {
+    const server = new FakeAppServer();
+    server.failHistoryAfterBootstrap = true;
+    const agent = createAgent(server, { useDefaultConversation: true });
+    const { context } = createContext();
+    try {
+      await expect(agent.loadSession({ sessionId: "default", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context)).rejects.toThrow("default history unavailable");
+      expect(server.closedSockets).toBeGreaterThan(0);
+      await expect(agent.prompt({ sessionId: "default", prompt: [{ type: "text", text: "must not send" }] }, context)).rejects.toThrow("Unknown session");
+      expect(server.inputs).toEqual([]);
+    } finally { agent.shutdown(); }
+  });
+
+  test("a disconnected replay client releases the opened default session", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { useDefaultConversation: true });
+    const { context } = createContext({ failHistoryReplay: true });
+    try {
+      await expect(agent.loadSession({ sessionId: "default", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context)).rejects.toThrow("client replay disconnected");
+      expect(server.closedSockets).toBeGreaterThan(0);
+      await expect(agent.prompt({ sessionId: "default", prompt: [{ type: "text", text: "must not send" }] }, context)).rejects.toThrow("Unknown session");
+      expect(server.inputs).toEqual([]);
+    } finally { agent.shutdown(); }
+  });
+
+  test("failed new and load response construction releases the opened default session", async () => {
+    for (const reload of [false, true]) {
+      const server = new FakeAppServer();
+      server.failCatalog = true;
+      const agent = createAgent(server, { useDefaultConversation: true });
+      const { context } = createContext();
+      try {
+        await expect(reload
+          ? agent.loadSession({ sessionId: "default", cwd: "/tmp/letta-acp-test", mcpServers: [] }, context)
+          : openSession(agent, context)).rejects.toThrow("catalog unavailable");
+        expect(server.closedSockets).toBeGreaterThan(0);
+        await expect(agent.prompt({ sessionId: "default", prompt: [{ type: "text", text: "must not send" }] }, context)).rejects.toThrow("Unknown session");
+        expect(server.inputs).toEqual([]);
+      } finally { agent.shutdown(); }
+    }
+  });
+
+  test("explicit tool budgets cannot be bypassed through harness execute commands", async () => {
+    for (const allowedTools of [[], ["Read"]]) {
+      const server = new FakeAppServer();
+      const agent = createAgent(server, { serverModel: true, allowedTools });
+      const { context } = createContext();
+      try {
+        const opened = await openSession(agent, context);
+        for (const text of ["/init", "/doctor", "/remember marker", "/toolset codex"]) {
+          const commandSeen = server.nextCommand();
+          const turn = agent.prompt({ sessionId: opened.sessionId, prompt: [{ type: "text", text }] }, context);
+          void turn.catch(() => {});
+          await Promise.race([turn, commandSeen]);
+          expect(server.executeCommands).toEqual([]);
+          expect(server.inputs).toEqual([]);
+          await turn;
+        }
+      } finally { agent.shutdown(); }
+    }
+  });
+
+  test("server control also blocks model changes in normal sessions with client MCP tools", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "letta-acp-policy-mcp-"));
+    const readyFile = join(cwd, "mcp-ready");
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { useDefaultConversation: true, serverModel: true, model: "stale/model-high" });
+    const { context } = createContext();
+    try {
+      const opened = await agent.newSession({ cwd, mcpServers: [{
+        name: "fixture", command: process.execPath,
+        args: [join(import.meta.dir, "fixtures/stubborn-mcp-server.ts")],
+        env: [{ name: "MCP_READY_FILE", value: readyFile }],
+      }] }, context);
+      expect(await readFile(readyFile, "utf8")).toBe("ready");
+      await expect(agent.setSessionConfigOption({ sessionId: opened.sessionId, configId: "model", value: "other-model" })).rejects.toThrow(/managed by Letta/);
+      await agent.prompt({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "/model other-model" }] }, context);
+      expect(server.updatedModelPayloads).toEqual([]);
+      expect(server.inputs).toEqual([]);
+    } finally {
+      agent.shutdown();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("server control rejects startup, config, reasoning, and slash model overrides", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { useDefaultConversation: true, serverModel: true, model: "stale/model-high", serverModelCompatId: "cached-high" });
+    const { context, updates } = createContext();
+    try {
+      const opened = await openSession(agent, context);
+      expect(opened.configOptions?.find(option => option.id === "model")).toMatchObject({ currentValue: "letta-server-default", options: [
+        expect.objectContaining({ value: "letta-server-default" }),
+        expect.objectContaining({ value: "cached-high" }),
+      ] });
+      for (const value of ["cached-high", "letta-server-default", "cached-high"]) {
+        const result = await agent.setSessionConfigOption({ sessionId: opened.sessionId, configId: "model", value });
+        expect(result.configOptions.find(option => option.id === "model")?.currentValue).toBe(value);
+      }
+      await agent.setSessionConfigOption({ sessionId: opened.sessionId, configId: "permissions", value: "standard" });
+      await expect(agent.setSessionConfigOption({ sessionId: opened.sessionId, configId: "model", value: "other-model" })).rejects.toThrow(/managed by Letta/);
+      await expect(agent.setSessionConfigOption({ sessionId: opened.sessionId, configId: "reasoning_effort", value: "low" })).rejects.toThrow();
+      for (const text of ["/model", "/model other-model"]) {
+        expect(await agent.prompt({ sessionId: opened.sessionId, prompt: [{ type: "text", text }] }, context)).toEqual({ stopReason: "end_turn" });
+      }
+      expect(updates.some(update => /managed by Letta/.test(String((update.content as WireMessage)?.text)))).toBe(true);
+      expect(server.updatedModelPayloads).toEqual([]);
+      expect(server.inputs).toEqual([]);
+      expect(server.runtimeStarts[0]?.model).toBeUndefined();
+    } finally { agent.shutdown(); }
+  });
+
+  test("default model discovery cannot mutate the shared thread without the full server policy", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { useDefaultConversation: true, model: "stale/model" });
+    const { context } = createContext();
+    try {
+      const opened = await openSession(agent, context);
+      await expect(agent.setSessionConfigOption({ sessionId: opened.sessionId, configId: "model", value: "other-model" })).rejects.toThrow(/discovery/);
+      await agent.prompt({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "/model other-model" }] }, context);
+      expect(server.updatedModelPayloads).toEqual([]);
+    } finally { agent.shutdown(); }
+  });
+
+  test("forwards configured session tool budgets including an empty budget", async () => {
+    for (const allowedTools of [["Read"], []]) {
+      const server = new FakeAppServer();
+      const agent = createAgent(server, { allowedTools, serverModel: true });
+      const { context } = createContext();
+      try {
+        const opened = await openSession(agent, context);
+        await agent.prompt({ sessionId: opened.sessionId, prompt: [{ type: "text", text: "plain prompt" }] }, context);
+        expect((server.inputs[0]?.payload as WireMessage).client_tool_allowlist).toEqual(allowedTools);
+        expect(server.updatedModelPayloads).toEqual([]);
+      } finally { agent.shutdown(); }
+    }
+  });
+
+  test("direct configs cannot create replacement agents or route cloud defaults as App Server defaults", () => {
+    for (const overrides of [
+      { agentId: undefined, useDefaultConversation: true },
+      { agentId: undefined, serverModel: true },
+      { useDefaultConversation: true, clientOptions: { backend: "cloud" as const, apiKey: "fixture-key" } },
+    ]) {
+      expect(() => createAgent(new FakeAppServer(), overrides)).toThrow();
+    }
+  });
+
   test("advertises and maps Agent SDK MCP transports", async () => {
     const servers: McpServer[] = [
       {

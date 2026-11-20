@@ -13,6 +13,10 @@
  *   LETTA_AGENT_ID             reuse an existing agent (recommended)
  *   LETTA_ACP_MODEL            optional model override (new agents default letta/auto)
  *   LETTA_ACP_PERMISSION_MODE  standard (default) | acceptEdits | unrestricted
+ *   LETTA_ACP_USE_DEFAULT_CONVERSATION  1 resumes the existing App Server default
+ *   LETTA_ACP_SERVER_MODEL     1 delegates model and reasoning to Letta
+ *   LETTA_ACP_SERVER_MODEL_COMPAT_ID  cached client selection delegation alias
+ *   LETTA_ACP_ALLOWED_TOOLS    optional JSON string array of session tool names
  */
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";

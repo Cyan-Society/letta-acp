@@ -36,7 +36,8 @@ import {
   type SDKResultMessage,
 } from "@letta-ai/letta-agent-sdk";
 import { authMethodsForClient } from "./auth.js";
-import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
+import { DEFAULT_ACP_MODEL, validateSessionPolicies, type LettaAcpConfig } from "./config.js";
+import { qualifyDefaultHistory } from "./default-history.js";
 import {
   createEditorTools,
   type EditorFsCapabilities,
@@ -98,10 +99,15 @@ interface AcpSessionState {
   cwd: string;
   /** Model handle reported by the runtime, updated after ACP model changes. */
   currentModel: string | undefined;
+  /** Heuristic for clients that discover a default session's model catalog without MCP. */
+  readOnlyDiscovery: boolean;
+  /** Client-local delegation selection; never an effective server model. */
+  serverModelChoice?: string;
 }
 
 /** Max history messages replayed on session/load. */
 const LOAD_HISTORY_LIMIT = 200;
+const SERVER_MODEL_ID = "letta-server-default";
 /** Number of project sessions returned in one session/list page. */
 const SESSION_LIST_PAGE_SIZE = 50;
 
@@ -162,6 +168,7 @@ export class LettaAcpAgent {
   };
 
   constructor(config: LettaAcpConfig) {
+    validateSessionPolicies(config);
     this.config = config;
     this.client = new LettaAgentClient(config.clientOptions);
     this.sessionRegistry = new SessionRegistry(
@@ -213,26 +220,30 @@ export class LettaAcpAgent {
     const agentId = await this.ensureAgent();
     const { sessionId, state } = await this.openSession({
       cwd: params.cwd,
-      resumeId: null,
+      resumeId: this.config.useDefaultConversation ? agentId : null,
       agentId,
       clientContext: cx,
       mcpServers: params.mcpServers,
     });
-    await this.rememberSession(agentId, sessionId, params.cwd);
-    log(`session ${sessionId} -> agent ${agentId} (cwd: ${params.cwd})`);
-    this.announceCommands(sessionId, cx);
-    return {
-      sessionId,
-      modes: sessionModeState(state.modeId),
-      configOptions: await this.sessionConfigOptions(state),
-    };
+    try {
+      const configOptions = await this.sessionConfigOptions(state);
+      await this.rememberSession(agentId, sessionId, params.cwd);
+      log(`session ${sessionId} -> agent ${agentId} (cwd: ${params.cwd})`);
+      await this.announceCommands(sessionId, cx);
+      return { sessionId, modes: sessionModeState(state.modeId), configOptions };
+    } catch (error) {
+      this.discardSession(sessionId, state);
+      throw error;
+    }
   }
 
   async loadSession(
     params: LoadSessionRequest,
     cx: AgentContext,
   ): Promise<LoadSessionResponse> {
+    const isDefault = this.config.useDefaultConversation && params.sessionId === "default";
     if (
+      !isDefault &&
       !params.sessionId.startsWith("conv-") &&
       !params.sessionId.startsWith("local-conv-")
     ) {
@@ -242,38 +253,49 @@ export class LettaAcpAgent {
     }
     const { sessionId, state } = await this.openSession({
       cwd: params.cwd,
-      resumeId: params.sessionId,
+      resumeId: isDefault ? await this.ensureAgent() : params.sessionId,
       agentId: null,
       clientContext: cx,
       mcpServers: params.mcpServers,
     });
-    await this.rememberSession(state.session.agentId, sessionId, params.cwd);
-    const history = await state.session.listMessages({
-      order: "desc",
-      limit: LOAD_HISTORY_LIMIT,
-    });
-    if (history.hasMore) {
-      log(
-        `session ${sessionId} has more than ${LOAD_HISTORY_LIMIT} messages; replaying the most recent ${LOAD_HISTORY_LIMIT}`,
-      );
+    try {
+      const history = await state.session.listMessages({
+        order: "desc",
+        limit: LOAD_HISTORY_LIMIT,
+      });
+      if (history.hasMore) {
+        log(
+          `session ${sessionId} has more than ${LOAD_HISTORY_LIMIT} messages; replaying the most recent ${LOAD_HISTORY_LIMIT}`,
+        );
+      }
+      const updates = historyToUpdates([...history.messages].reverse(), {
+        terminalOutput: this.supportsTerminalOutput,
+        cwd: state.cwd,
+      });
+      for (const update of updates) {
+        await cx.notify(methods.client.session.update, { sessionId, update });
+      }
+      const configOptions = await this.sessionConfigOptions(state);
+      await this.rememberSession(state.session.agentId, sessionId, params.cwd);
+      log(`loaded session ${sessionId} (${updates.length} replayed updates)`);
+      await this.announceCommands(sessionId, cx);
+      return { modes: sessionModeState(state.modeId), configOptions };
+    } catch (error) {
+      this.discardSession(sessionId, state);
+      throw error;
     }
-    const updates = historyToUpdates([...history.messages].reverse(), {
-      terminalOutput: this.supportsTerminalOutput,
-      cwd: state.cwd,
-    });
-    for (const update of updates) {
-      await cx.notify(methods.client.session.update, { sessionId, update });
-    }
-    log(`loaded session ${sessionId} (${updates.length} replayed updates)`);
-    this.announceCommands(sessionId, cx);
-    return {
-      modes: sessionModeState(state.modeId),
-      configOptions: await this.sessionConfigOptions(state),
-    };
+  }
+
+  private discardSession(sessionId: string, state: AcpSessionState): void {
+    state.session.close();
+    if (this.sessions.get(sessionId) === state) this.sessions.delete(sessionId);
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     const agentId = await this.ensureAgent();
+    if (this.config.useDefaultConversation) {
+      return { sessions: [{ sessionId: "default", cwd: params.cwd ?? process.cwd(), title: "Default Letta conversation" }] };
+    }
     const records = await this.sessionRegistry.list(agentId, params.cwd);
     if (records.length === 0) return { sessions: [] };
 
@@ -352,6 +374,19 @@ export class LettaAcpAgent {
   private async sessionConfigOptions(
     state: AcpSessionState,
   ): Promise<SessionConfigOption[]> {
+    if (this.config.serverModel) {
+      const compatId = this.config.serverModelCompatId;
+      return [permissionModeConfigOption(state.modeId), {
+        id: "model", name: "Model", category: "model", type: "select",
+        description: "Model and reasoning are managed by Letta. Change them in the Letta app.",
+        currentValue: state.serverModelChoice ?? SERVER_MODEL_ID,
+        options: [{ value: SERVER_MODEL_ID, name: "Use Letta server settings",
+          description: "Inherit Letta's model and reasoning without a client override." },
+          ...(compatId && compatId !== SERVER_MODEL_ID ? [{ value: compatId,
+            name: "Use Letta server settings (compatible with previous client selection)",
+            description: "This cached identifier delegates too; it does not select a model or reasoning level." }] : [])],
+      }];
+    }
     const { entries } = await state.session.listModels();
     const models = [...new Map(entries.map((entry) => [entry.id, entry])).values()];
     const selected = models.find(
@@ -408,6 +443,14 @@ export class LettaAcpAgent {
       return { configOptions: await this.sessionConfigOptions(state) };
     }
     if (params.configId === "model") {
+      if (this.config.serverModel) {
+        if (params.value !== SERVER_MODEL_ID && params.value !== this.config.serverModelCompatId) {
+          throw new Error("Model and reasoning are managed by Letta; select Use Letta server settings");
+        }
+        state.serverModelChoice = params.value as string;
+        return { configOptions: await this.sessionConfigOptions(state) };
+      }
+      if (state.readOnlyDiscovery) throw new Error("Model discovery cannot change the shared default conversation");
       if (typeof params.value !== "string") {
         throw new Error("The model configuration option requires a model id");
       }
@@ -468,9 +511,12 @@ export class LettaAcpAgent {
         this.sessions.get(ref.sessionId)?.clientContext ?? null,
     });
     const mcpServers = toSdkMcpServers(options.mcpServers);
+    const resumingDefault = this.config.useDefaultConversation && options.resumeId === this.config.agentId;
+    const readOnlyDiscovery = Boolean(resumingDefault && (options.mcpServers?.length ?? 0) === 0);
     const sessionOptions = {
       cwd: options.cwd,
-      model: this.config.model,
+      model: this.config.serverModel || readOnlyDiscovery ? undefined : this.config.model,
+      ...(this.config.allowedTools !== undefined ? { allowedTools: this.config.allowedTools } : {}),
       permissionMode: "standard" as const,
       canUseTool: (
         toolName: string,
@@ -489,9 +535,19 @@ export class LettaAcpAgent {
     const session = options.resumeId
       ? this.client.resumeSession(options.resumeId, sessionOptions)
       : this.client.createSession(options.agentId ?? "", sessionOptions);
-    // Force runtime initialization so the conversation id and active model exist.
-    const bootstrap = await session.bootstrapState({ limit: 1 });
-    const sessionId = options.resumeId ?? session.conversationId;
+    if (resumingDefault) qualifyDefaultHistory(session, this.config.agentId!);
+    let bootstrap;
+    try {
+      // Force runtime initialization so the conversation id and active model exist.
+      bootstrap = await session.bootstrapState({ limit: 1 });
+      if (resumingDefault && (session.conversationId !== "default" || session.agentId !== this.config.agentId)) {
+        throw new Error("Letta did not resume the configured agent's default conversation");
+      }
+    } catch (error) {
+      session.close();
+      throw error;
+    }
+    const sessionId = session.conversationId ?? options.resumeId;
     if (!sessionId) {
       session.close();
       throw new Error("Letta session did not report a conversation id");
@@ -513,6 +569,7 @@ export class LettaAcpAgent {
       modeId: this.config.permissionMode,
       cwd: options.cwd,
       currentModel: bootstrap.model ?? this.config.model,
+      readOnlyDiscovery,
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -525,11 +582,11 @@ export class LettaAcpAgent {
     return { sessionId, state };
   }
 
-  private announceCommands(sessionId: string, cx: AgentContext): void {
+  private async announceCommands(sessionId: string, cx: AgentContext): Promise<void> {
     const cwd = this.sessions.get(sessionId)?.cwd ?? process.cwd();
     const availableCommands = buildAvailableCommands(cwd);
     log(`advertising ${availableCommands.length} slash commands`);
-    void cx.notify(methods.client.session.update, {
+    await cx.notify(methods.client.session.update, {
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
@@ -628,11 +685,6 @@ export class LettaAcpAgent {
     const command = (match[1] ?? "").toLowerCase();
     const argument = match[2]?.trim();
 
-    if (isExecuteCommand(command)) {
-      return this.runExecuteCommand(params.sessionId, state, cx, command, argument);
-    }
-    if (command !== "model") return null;
-
     const reply = async (text: string) => {
       await cx.notify(methods.client.session.update, {
         sessionId: params.sessionId,
@@ -642,6 +694,22 @@ export class LettaAcpAgent {
         },
       });
     };
+    if (isExecuteCommand(command)) {
+      // SDK 0.7.2's execute_command does not propagate client_tool_allowlist.
+      // Some commands start full agent turns; do not silently widen the budget.
+      if (this.config.allowedTools !== undefined) {
+        await reply("Harness commands are disabled while a session tool budget is set: this SDK cannot preserve the budget for execute_command. Run the command in Letta instead.");
+        return { stopReason: "end_turn" };
+      }
+      return this.runExecuteCommand(params.sessionId, state, cx, command, argument);
+    }
+    if (command !== "model") return null;
+    if (this.config.serverModel || (state.readOnlyDiscovery && argument)) {
+      await reply(this.config.serverModel
+        ? "Model and reasoning are managed by Letta. Change them in the Letta app; the client sends no override."
+        : "Model discovery cannot change the shared default conversation.");
+      return { stopReason: "end_turn" };
+    }
     try {
       if (!argument) {
         const result = await state.session.listModels();

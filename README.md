@@ -180,6 +180,15 @@ non-loopback deployments enable auth
 | `LETTA_AGENT_ID` | reuse an existing agent instead of creating a visible, globally unpinned agent named `Letta` |
 | `LETTA_ACP_MODEL` | optional model override for sessions, as a `provider/model` handle (e.g. `anthropic/claude-fable-5`, `openai/gpt-4.1`); new agents default to `letta/auto`, while reused agents keep their model when this is unset — run `/model` to list valid handles |
 | `LETTA_ACP_PERMISSION_MODE` | initial session mode: `standard` (default), `acceptEdits`, `unrestricted` — switchable live via `session/set_mode` (Zed's mode dropdown) |
+| `LETTA_ACP_USE_DEFAULT_CONVERSATION` | `1` resumes the configured existing App Server agent's `default` for fresh sessions and default reloads; no create fallback. Unset or `0` retains separate-conversation behavior. |
+| `LETTA_ACP_SERVER_MODEL` | `1` delegates model and reasoning selection to the existing Letta agent, ignores `LETTA_ACP_MODEL`, and blocks ACP and `/model` overrides. Unset or `0` retains upstream model controls. |
+| `LETTA_ACP_SERVER_MODEL_COMPAT_ID` | optional cached client model ID accepted as another delegation choice when server model control is enabled; it never selects that model or effort |
+| `LETTA_ACP_ALLOWED_TOOLS` | optional JSON string array passed as a session-only SDK tool budget, e.g. `["Read","mcp__example__*"]`; `[]` is an explicit empty budget |
+
+For persistent existing-agent integrations, see [OpenBot integration policies](docs/openbot-integration.md).
+This fork branch uses the tested `v0.1.11` source and pins SDK `0.7.2`;
+it does not include later upstream SDK upgrades. The policies are opt-in and
+do not configure every saved client connection automatically.
 
 Note on tool execution: with `remote` and `cloud`, built-in tools (Read, Bash,
 …) run where the harness runs — the server/sandbox filesystem, not your

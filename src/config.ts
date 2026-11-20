@@ -12,6 +12,14 @@ export interface LettaAcpConfig {
   agentId?: string;
   /** Model override for sessions (e.g. "anthropic/claude-sonnet-4"). */
   model?: string;
+  /** Resume the configured App Server agent's default instead of creating threads. */
+  useDefaultConversation?: boolean;
+  /** Delegate all model and reasoning selection to the existing Letta agent. */
+  serverModel?: boolean;
+  /** One cached client model ID accepted only as another delegation choice. */
+  serverModelCompatId?: string;
+  /** Session-only SDK tool budget; undefined retains the server's default tools. */
+  allowedTools?: string[];
   /** Letta permission mode; tool approvals are forwarded to the ACP client. */
   permissionMode: PermissionMode;
   /** Directory for controller-owned ACP session metadata; null keeps it in memory. */
@@ -38,6 +46,34 @@ const PERMISSION_MODES: PermissionMode[] = [
 
 const BACKENDS = ["local", "remote", "cloud", "cloud-oauth"] as const;
 export const DEFAULT_ACP_MODEL = "letta/auto";
+
+function policyFlag(env: Record<string, string | undefined>, name: string): boolean {
+  const value = env[name];
+  if (value === undefined || value === "0") return false;
+  if (value === "1") return true;
+  throw new Error(`${name} must be 0 or 1`);
+}
+
+function toolBudget(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed) && parsed.every(item => typeof item === "string" && item.trim().length > 0)) {
+      return parsed;
+    }
+  } catch { /* Report the same actionable error for malformed JSON and shapes. */ }
+  throw new Error("LETTA_ACP_ALLOWED_TOOLS must be a JSON array of nonempty tool names");
+}
+
+/** Also applied by the agent constructor for callers supplying typed config. */
+export function validateSessionPolicies(config: LettaAcpConfig): void {
+  if ((config.useDefaultConversation || config.serverModel) && !config.agentId?.trim()) {
+    throw new Error("Default-conversation and server-model policies require an existing agent (LETTA_AGENT_ID)");
+  }
+  if (config.useDefaultConversation && config.clientOptions.backend === "cloud") {
+    throw new Error("Default-conversation routing is supported only by the App Server backends, not direct cloud");
+  }
+}
 
 export function configFromEnv(
   env: Record<string, string | undefined> = process.env,
@@ -104,13 +140,20 @@ export function configFromEnv(
     );
   }
 
-  return {
+  const serverModel = policyFlag(env, "LETTA_ACP_SERVER_MODEL");
+  const config: LettaAcpConfig = {
     clientOptions,
     agentId: env.LETTA_AGENT_ID,
-    model: env.LETTA_ACP_MODEL,
+    model: serverModel ? undefined : env.LETTA_ACP_MODEL,
+    useDefaultConversation: policyFlag(env, "LETTA_ACP_USE_DEFAULT_CONVERSATION"),
+    serverModel,
+    serverModelCompatId: env.LETTA_ACP_SERVER_MODEL_COMPAT_ID || undefined,
+    allowedTools: toolBudget(env.LETTA_ACP_ALLOWED_TOOLS),
     permissionMode: permissionMode as PermissionMode,
     sessionRegistryDir:
       env.LETTA_ACP_STATE_DIR ?? join(homedir(), ".letta", "letta-acp", "sessions"),
     sessionRegistryScope,
   };
+  validateSessionPolicies(config);
+  return config;
 }
