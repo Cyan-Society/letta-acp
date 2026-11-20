@@ -82,11 +82,12 @@ jobs:
             }
           ' "$response"
 
-  # Keep credentials on trusted main-branch code. Pull requests still run the
-  # deterministic acpx suite above, including forks and Dependabot.
+  # Live tests create agents and consume provider credits. Forks opt in explicitly
+  # with LETTA_ACP_RUN_LIVE_TESTS=1 and their own credentials; deterministic tests
+  # and the package check above remain automatic.
   live-local:
     name: Live local backend
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.LETTA_ACP_RUN_LIVE_TESTS == '1' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -110,7 +111,7 @@ jobs:
 
   live-cloud:
     name: Live Cloud backend
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.LETTA_ACP_RUN_LIVE_TESTS == '1' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 

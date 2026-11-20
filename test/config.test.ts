@@ -41,4 +41,34 @@ describe("ACP agent defaults", () => {
       },
     });
   });
+
+  test("parses opt-in policies without retaining a startup model override", () => {
+    const config = configFromEnv({
+      LETTA_AGENT_ID: "agent-existing",
+      LETTA_ACP_USE_DEFAULT_CONVERSATION: "1",
+      LETTA_ACP_SERVER_MODEL: "1",
+      LETTA_ACP_MODEL: "stale/model-high",
+      LETTA_ACP_SERVER_MODEL_COMPAT_ID: "cached-model-high",
+      LETTA_ACP_ALLOWED_TOOLS: '["Read","mcp__example__*"]',
+    });
+    expect(config).toMatchObject({
+      useDefaultConversation: true,
+      serverModel: true,
+      serverModelCompatId: "cached-model-high",
+      allowedTools: ["Read", "mcp__example__*"],
+    });
+    expect(config.model).toBeUndefined();
+  });
+
+  test("rejects invalid policy switches and tool budgets", () => {
+    for (const key of ["LETTA_ACP_USE_DEFAULT_CONVERSATION", "LETTA_ACP_SERVER_MODEL"]) {
+      expect(() => configFromEnv({ [key]: "true" })).toThrow(key);
+      expect(() => configFromEnv({ [key]: "1" })).toThrow("existing agent");
+    }
+    for (const value of ['not-json', '{}', '[null]', '[""]', '["  "]']) {
+      expect(() => configFromEnv({ LETTA_ACP_ALLOWED_TOOLS: value })).toThrow("LETTA_ACP_ALLOWED_TOOLS");
+    }
+    expect(configFromEnv({ LETTA_ACP_ALLOWED_TOOLS: '[]' }).allowedTools).toEqual([]);
+    expect(configFromEnv({ LETTA_ACP_SERVER_MODEL: "0" }).serverModel).toBe(false);
+  });
 });

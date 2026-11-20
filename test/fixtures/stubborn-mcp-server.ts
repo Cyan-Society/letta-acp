@@ -27,6 +27,7 @@ process.stdin.on("data", (chunk: Buffer) => {
           serverInfo: { name: "stubborn-test-server", version: "1.0.0" },
         });
       } else if (message.method === "tools/list") {
+        if (process.env.MCP_READY_FILE) writeFileSync(process.env.MCP_READY_FILE, "ready");
         respond(message.id, { tools: [] });
       }
     }
